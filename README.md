@@ -504,6 +504,23 @@ What the endpoint does and doesn't do:
 - A client hanging up mid-generation cancels it only for streamed requests, and
   only when it's the sole request in flight.
 
+## Claude Code: dual-workspace setup (MULTI-AI + Claude-Vault)
+
+To run Claude Code with simultaneous access to both **MULTI-AI** and the team knowledge base in **Claude-Vault**:
+
+```powershell
+# Directly via CLI:
+claude --add-dir "c:\Users\cajga\Documents\Claude-Vault" --add-dir "c:\Users\cajga\Documents\GitHub\MULTI-AI"
+
+# Or if already inside MULTI-AI:
+claude --add-dir "c:\Users\cajga\Documents\Claude-Vault"
+
+# Or using the configured PowerShell profile shortcut (from any directory):
+claude-multi   # or 'cm'
+```
+
+This allows Claude Code to explore, cross-reference, and edit files across both repositories in a single session while respecting their guidelines (`CLAUDE.md`).
+
 ## File Architecture
 
 ```

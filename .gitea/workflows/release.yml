@@ -1,0 +1,570 @@
+# Builds the Windows and Android release packages and attaches them both to a
+# single GitHub release.
+#
+# Triggered by pushing a tag like `v1.0.0`, or manually from the Actions tab
+# (which builds and uploads the packages as workflow artifacts without
+# publishing a release — useful for testing the pipeline itself).
+#
+# Windows packaging is Velopack's `vpk`, not Inno Setup. The reason is delta
+# updates: vpk diffs each release against the previous one and emits a patch
+# alongside the full package, so an existing install downloads a few MB
+# instead of the whole app, and the app applies it itself behind a "Relaunch
+# to Update" button. See app/lib/update_service.dart. installer/multi-ai.iss
+# is no longer built by anything and is kept only for reference.
+#
+# The interesting constraint on Windows is that this cannot ship a
+# self-contained bundle. The backend's dependencies are ~4.5GB installed
+# (torch alone is 4.12GB, because the cu128 wheel carries the CUDA runtime),
+# and a GitHub release asset is capped at 2GB. So the package carries the
+# app, an embeddable CPython and the Cython-compiled backend — about 200MB —
+# and the app pip-installs the rest on first launch. See
+# app/lib/backend_process.dart.
+#
+# Android ships as a plain signed APK instead of going through the Play
+# Store — no developer-account review, data-safety form, or closed-testing
+# gate, at the cost of no store listing and no automatic updates (users
+# re-download and reinstall over the existing app for each new version).
+# It needs none of the Windows job's backend-bundling complexity: per the
+# README, Android is on-device-GGUF-only and never talks to the Python
+# backend, so the APK is just the Flutter app. Release signing uses a
+# keystore reconstructed from repo secrets — see the "Shipping an Android
+# release" section of the README for how it was generated and how to rotate
+# it. velopack_flutter (the Windows/Linux/macOS updater) explicitly no-ops
+# its native build on Android/iOS (see its hook/build.dart), so this job
+# needs no Rust toolchain.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  # Must match the embeddable runtime below at the minor version: the compiled
+  # extensions are ABI-tagged (server.cp314-win_amd64.pyd) and CPython refuses
+  # to load a .pyd built for a different minor version.
+  PYTHON_VERSION: '3.14'
+  PYTHON_EMBED_VERSION: '3.14.6'
+  FLUTTER_VERSION: '3.44.4'
+  # Only used to re-verify the committed .c is in sync before packaging (the
+  # build itself compiles the .c and needs no Cython). Must match the pin in
+  # scripts/regen_cython.py — Cython's codegen isn't byte-stable across versions.
+  CYTHON_VERSION: '3.3.0'
+
+jobs:
+  # ---------------------------------------------------------------
+  # 0. Derive one version string both platform jobs build against
+  # ---------------------------------------------------------------
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Derive version
+        id: version
+        shell: bash
+        run: |
+          # A tag push releases that version; a manual run is an untagged test
+          # build, labelled from the commit so two of them can't collide.
+          #
+          # Two things about the dev version are load-bearing, both learned the
+          # hard way (on the Windows/vpk side, but the version string is shared,
+          # so both jobs inherit the constraint):
+          #
+          #  - It starts 0.0.1, not 0.0.0. `vpk pack` rejects anything below
+          #    0.0.1 outright ("it must be >= 0.0.1"), which would fail every
+          #    manual run - the exact path these builds exist to rehearse.
+          #  - The run number goes in the *prerelease* segment, not just the
+          #    build metadata after '+'. SemVer ignores build metadata when
+          #    ordering versions, so `0.0.1-dev+aaaaaaa` and `0.0.1-dev+bbbbbbb`
+          #    compare as equal and Velopack would treat the second test build
+          #    as "not newer", skipping the delta generation being rehearsed.
+          #    (vpk also drops the '+sha' from package filenames, so the run
+          #    number is what actually keeps two builds distinct on disk. The
+          #    sha stays on for traceability.)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            v="${GITHUB_REF#refs/tags/v}"
+          else
+            v="0.0.1-dev.${{ github.run_number }}+$(echo "$GITHUB_SHA" | cut -c1-7)"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "Building version $v"
+
+  # ---------------------------------------------------------------
+  # 1. Windows
+  # ---------------------------------------------------------------
+  build-windows:
+    needs: version
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # -------------------------------------------------------
+      # 1a. Compile the backend
+      # -------------------------------------------------------
+      # The committed .c files (regenerated from the .pyx sources by
+      # scripts/regen_cython.py) are compiled straight to .pyd here — Cython
+      # does not run in this job. The .pyd are git-ignored (platform- and
+      # version-specific) so they're built here rather than committed;
+      # windows-latest ships the MSVC toolchain the C compile needs.
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Verify the committed C matches the .pyx sources
+        shell: pwsh
+        run: |
+          # A stale .c ships code that doesn't match its .pyx — exactly what
+          # broke the v1.0.1 release. backend-check.yml already gates this on
+          # PRs, but a tag can be pushed from a branch that skipped it, so
+          # re-check here before building anything.
+          python -m pip install "Cython==${{ env.CYTHON_VERSION }}"
+          python scripts/regen_cython.py
+          $stale = git diff --name-only -- '*.c'
+          if ($stale) {
+            git diff -- '*.c'
+            throw "Committed .c is out of sync with the .pyx sources. Run 'python scripts/regen_cython.py' and commit:`n$stale"
+          }
+
+      - name: Build the compiled backend
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          # --inplace puts each .pyd next to its source, which is the layout the
+          # staging step below copies and the runtime imports.
+          python setup.py build_ext --inplace
+          $pyds = Get-ChildItem Multi-AI\multi_ai -Recurse -Filter *.pyd
+          Write-Output "Compiled $($pyds.Count) extension modules"
+          if ($pyds.Count -lt 2) { throw "Backend build produced no extension modules" }
+
+      - name: Smoke-test the compiled backend
+        shell: pwsh
+        run: |
+          # Catches a build that "succeeded" but produced modules that cannot
+          # actually be imported - far cheaper to find here than in an
+          # installer a downloader is already running.
+          $env:PYTHONPATH = "$PWD\Multi-AI"
+          python -c "from multi_ai.server import run; import multi_ai.hardware; print('backend imports OK')"
+
+      # -------------------------------------------------------
+      # 1b. Build the Flutter Windows app
+      # -------------------------------------------------------
+
+      # Must come before the Flutter build, not just before packaging. The app
+      # depends on velopack_flutter, which is a flutter_rust_bridge package —
+      # `flutter build windows` compiles its Rust crate as part of the build
+      # and fails outright without a toolchain on PATH.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Build Flutter release
+        shell: pwsh
+        working-directory: app
+        run: |
+          flutter config --enable-windows-desktop
+          # Redundant on Flutter 3.44 (it defaults to on) but stated because
+          # the build depends on it: velopack_flutter ships its Rust core as a
+          # code asset built by hook/build.dart, and with native assets off it
+          # is silently not built. Cheap insurance against the default changing
+          # under a FLUTTER_VERSION bump.
+          flutter config --enable-native-assets
+          flutter pub get
+          flutter build windows --release --build-name=${{ needs.version.outputs.version }}
+
+      # -------------------------------------------------------
+      # 1c. Assemble the package payload
+      # -------------------------------------------------------
+      # Everything lands in one tree, installer\staging\app, with the backend
+      # nested at staging\app\backend. Inno used to merge two sibling trees at
+      # install time via two [Files] entries; vpk pack takes a single --packDir
+      # and lays it out verbatim, so the nesting has to exist here instead. The
+      # invariant that matters is unchanged: backend\ sits beside the
+      # executable, which is where BackendRuntime.backendDir looks for it.
+      #
+      # These three steps are ordered, not arbitrary. The Flutter tree is
+      # copied first because Copy-Item into an *existing* directory nests the
+      # source inside it rather than merging, so creating staging\app\backend
+      # first would produce staging\app\Release\.
+
+      - name: Stage the Flutter release tree
+        shell: pwsh
+        run: |
+          # exe + DLLs + data\. All of it is required; the exe alone will not
+          # launch.
+          Copy-Item -Recurse -Force app\build\windows\x64\runner\Release installer\staging\app
+          # Apache-2.0 requires the license and NOTICE to travel with the binaries.
+          Copy-Item -Force LICENSE, NOTICE installer\staging\app
+          Copy-Item -Recurse -Force licenses installer\staging\app
+
+      - name: Fetch embeddable CPython and pip
+        shell: pwsh
+        run: |
+          $ver = "${{ env.PYTHON_EMBED_VERSION }}"
+          New-Item -ItemType Directory -Force installer\staging\app\backend\python | Out-Null
+          Invoke-WebRequest -Uri "https://www.python.org/ftp/python/$ver/python-$ver-embed-amd64.zip" -OutFile embed.zip
+          Expand-Archive embed.zip -DestinationPath installer\staging\app\backend\python -Force
+
+          # The embeddable distribution's ._pth replaces normal path setup and
+          # ships with `import site` commented out. pip's zipapp needs the site
+          # module, so re-enable it. (This does NOT make PYTHONPATH work - a
+          # ._pth disables it outright, which is why the backend receives its
+          # paths through MULTI_AI_PATH instead. See installer/runtime/bootstrap.py.)
+          $pth = Get-ChildItem installer\staging\app\backend\python -Filter "python*._pth" | Select-Object -First 1
+          (Get-Content $pth.FullName) -replace '^#\s*import site', 'import site' | Set-Content $pth.FullName -Encoding ascii
+
+          # pip as a zipapp rather than an installed package: the interpreter
+          # lives in the install directory and is replaced wholesale on every
+          # update, so there is nowhere durable for a real pip install to go.
+          # pip.pyz needs no install.
+          Invoke-WebRequest -Uri "https://bootstrap.pypa.io/pip/pip.pyz" -OutFile installer\staging\app\backend\pip.pyz
+
+      - name: Stage the compiled backend
+        shell: pwsh
+        run: |
+          # .pyx sources and generated .c are build inputs, not runtime files -
+          # excluding them keeps the payload small and stops anyone assuming
+          # the .pyx is what runs.
+          $dest = "installer\staging\app\backend\multi_ai"
+          Copy-Item -Recurse -Force Multi-AI\multi_ai $dest
+          Get-ChildItem $dest -Recurse -Include *.pyx,*.c | Remove-Item -Force
+          Get-ChildItem $dest -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Force
+
+          Copy-Item installer\runtime\bootstrap.py     installer\staging\app\backend\
+          Copy-Item installer\runtime\requirements.txt installer\staging\app\backend\
+          Copy-Item NOTICE-python.txt installer\staging\app\backend\
+
+          Write-Output "--- staged payload ---"
+          $backend = Get-ChildItem installer\staging\app\backend -Recurse -File | Measure-Object Length -Sum
+          $total   = Get-ChildItem installer\staging\app         -Recurse -File | Measure-Object Length -Sum
+          "{0:N1} MB backend" -f ($backend.Sum / 1MB)
+          "{0:N1} MB total (app + backend)" -f ($total.Sum / 1MB)
+
+      - name: Verify the staged backend runs
+        shell: pwsh
+        run: |
+          # Runs the bundled interpreter against the bundled backend exactly as
+          # the app will. It cannot chat (torch is not installed - that is the
+          # first-run download), but importing the server and serving
+          # /api/models exercises the ._pth / MULTI_AI_PATH wiring, which is
+          # the part most likely to be silently wrong.
+          # _list_models() enumerates the roster from the model files present.
+          # The staging tree has had its .pyx stripped, so this asserts the
+          # enumeration finds the compiled .pyd modules instead — an empty list
+          # here means a release that shows the app only its on-device fallback.
+          # (Listing needs no torch; that is the first-run download.)
+          $backend = "$PWD\installer\staging\app\backend"
+          $env:MULTI_AI_PATH = $backend
+          & "$backend\python\python.exe" -c "import sys; sys.path.insert(0, r'$backend'); from multi_ai.server import run, _list_models; n = len(_list_models()); assert n > 0, 'staged backend lists no models - roster enumeration is not finding the compiled .pyd modules'; print(f'bundled backend imports OK; /api/models lists {n} models')"
+
+      # -------------------------------------------------------
+      # 1d. Pack the release
+      # -------------------------------------------------------
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install the Velopack CLI
+        shell: pwsh
+        run: |
+          dotnet tool install -g vpk
+          # `dotnet tool install -g` drops shims in ~\.dotnet\tools, which is
+          # not on PATH for subsequent steps unless it is added explicitly.
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Pack
+        shell: pwsh
+        run: |
+          # Fetch the previous release's packages so pack has something to diff
+          # against. This is what makes the update a delta rather than a full
+          # ~200MB re-download. On the very first release there is nothing to
+          # fetch: vpk logs "No releases found" and exits 0, so this does not
+          # need guarding, and that run legitimately produces no delta.
+          #
+          # It reads the latest *published* release, matching what installed
+          # apps see (see below). If the previous version is still sitting as
+          # an unpublished draft, this diffs against whatever was published
+          # before it - so publish or delete each draft before tagging the next
+          # version, or a release simply ships without a delta.
+          vpk download github `
+              --repoUrl https://github.com/CAJ654/MULTI-AI `
+              --token ${{ secrets.GH_RELEASE_TOKEN }} `
+              -o Releases
+
+          # --packId is this app's permanent identity, the way Inno's AppId GUID
+          # was: Velopack matches installs on it and derives the install root
+          # (%LOCALAPPDATA%\MultiAI) from it. Changing it later orphans every
+          # existing install, so it does not change.
+          vpk pack `
+              --packId MultiAI `
+              --packTitle "Multi-AI" `
+              --packAuthors "CAJ654" `
+              --packVersion ${{ needs.version.outputs.version }} `
+              --packDir installer\staging\app `
+              --mainExe multi_ai.exe `
+              -o Releases
+
+          # vpk download left the previous version's full package here purely
+          # as a diff source. Clients never fetch it - an install applying a
+          # delta patches the copy it already has on disk, and one too far
+          # behind for the delta chain falls back to the *new* full package -
+          # so shipping it again would add ~200MB to every release for nothing.
+          $version = "${{ needs.version.outputs.version }}"
+          Get-ChildItem Releases\*-full.nupkg |
+            Where-Object { $_.Name -ne "MultiAI-$version-full.nupkg" } |
+            Remove-Item -Force
+
+          Write-Output "--- release assets ---"
+          Get-ChildItem Releases | ForEach-Object {
+            "{0,-44} {1,8:N1} MB" -f $_.Name, ($_.Length / 1MB)
+          }
+
+      - name: Check the assets fit GitHub's limit
+        shell: pwsh
+        run: |
+          # The 2GB cap is per asset, not per release, so every file has to be
+          # checked rather than just the largest single artifact. If this trips,
+          # something heavy leaked into the payload that belongs in the
+          # first-run download instead.
+          $over = Get-ChildItem Releases -File | Where-Object { $_.Length -gt 2GB }
+          if ($over) {
+            throw "Over GitHub's 2 GB per-asset limit: $($over.Name -join ', ')"
+          }
+
+      - uses: actions/upload-artifact@v3
+        with:
+          name: MultiAI-windows-${{ needs.version.outputs.version }}
+          path: Releases/*
+
+  # ---------------------------------------------------------------
+  # 2. Android
+  # ---------------------------------------------------------------
+  build-android:
+    needs: version
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # The runner container has no Android SDK (GitHub's ubuntu image does);
+      # this provides ANDROID_HOME and build-tools for the apksigner check.
+      - uses: android-actions/setup-android@v3
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Restore the release keystore
+        working-directory: app/android
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          # key.properties/upload-keystore.jks are gitignored (see
+          # app/android/.gitignore) - build.gradle.kts falls back to debug
+          # signing when they're absent, so a missing/misconfigured secret
+          # here fails loudly at "verify signing" below rather than silently
+          # shipping a debug-signed APK.
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "::error::ANDROID_KEYSTORE_BASE64 secret is not set - see the README's Shipping an Android release section"
+            exit 1
+          fi
+          # The secret's raw length is not sensitive (GitHub only masks the
+          # literal value, not a count of it) and is the one thing worth
+          # knowing when this step fails: a real upload-keystore.jks base64s
+          # to several KB, so a suspiciously short number here means the
+          # secret itself is truncated/wrong, not a decode-flag problem.
+          echo "ANDROID_KEYSTORE_BASE64 is ${#ANDROID_KEYSTORE_BASE64} characters"
+          # --ignore-garbage: a plain `base64 -d` rejects *any* character
+          # outside the base64 alphabet, including a stray \r from the string
+          # picking up CRLF somewhere between PowerShell and the secret box -
+          # that turned out not to be the whole story (still failed after
+          # stripping whitespace), so this now tolerates arbitrary embedded
+          # garbage too and relies on the size/signing checks below to catch
+          # a genuinely wrong secret instead of base64 itself.
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 -d --ignore-garbage > upload-keystore.jks
+          # A real keystore is several KB; --ignore-garbage above would
+          # otherwise let a mostly-garbage secret through as a near-empty
+          # file that fails confusingly much later, deep in Gradle.
+          jks_size=$(stat -c%s upload-keystore.jks)
+          echo "upload-keystore.jks is $jks_size bytes"
+          if [ "$jks_size" -lt 500 ]; then
+            echo "::error::Decoded upload-keystore.jks is only $jks_size bytes - ANDROID_KEYSTORE_BASE64 is truncated or wrong. Regenerate it with [Convert]::ToBase64String([System.IO.File]::ReadAllBytes(\"upload-keystore.jks\")) and reset the GitHub secret from that console output directly - see the README's 'Shipping an Android release' section."
+            exit 1
+          fi
+          cat > key.properties <<EOF
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyPassword=$ANDROID_KEYSTORE_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          storeFile=upload-keystore.jks
+          EOF
+
+      - name: Regenerate the on-device roster asset
+        working-directory: app
+        run: |
+          # Android never talks to the Python backend, so the model roster
+          # ships as a build-time asset generated from the .pyx sources
+          # instead of coming from /api/models. See tool/generate_on_device_roster.dart
+          # and the README's "Bundle the model roster as an asset" note.
+          dart run tool/generate_on_device_roster.dart
+
+      - name: Build release APK
+        working-directory: app
+        run: |
+          flutter pub get
+          flutter build apk --release \
+            --build-name=${{ needs.version.outputs.version }} \
+            --build-number=${{ github.run_number }}
+
+      - name: Verify the APK is signed with the release key, not debug
+        shell: bash
+        run: |
+          # Catches the failure mode key.properties exists to prevent: a
+          # missing/empty secret silently falling back to Gradle's debug
+          # signingConfig, which produces an APK nobody can update over later
+          # (Android refuses to install-over an app when the signing
+          # certificate changes) without every existing user uninstalling first.
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" -maxdepth 1 -mindepth 1 | sort -V | tail -1)"
+          CERT_DN=$("$BUILD_TOOLS/apksigner" verify --print-certs \
+            app/build/app/outputs/flutter-apk/app-release.apk | grep 'certificate DN' | head -1)
+          echo "Signed by: $CERT_DN"
+          if echo "$CERT_DN" | grep -qi "Android Debug"; then
+            echo "::error::APK is signed with the debug key - ANDROID_KEYSTORE_BASE64 was not applied"
+            exit 1
+          fi
+
+      - name: Stage the release asset
+        shell: bash
+        run: |
+          mkdir -p Releases-android
+          cp app/build/app/outputs/flutter-apk/app-release.apk \
+            "Releases-android/MultiAI-${{ needs.version.outputs.version }}-android.apk"
+
+      - uses: actions/upload-artifact@v3
+        with:
+          name: MultiAI-android-${{ needs.version.outputs.version }}
+          path: Releases-android/*
+
+  # ---------------------------------------------------------------
+  # 3. Publish both platforms to one release
+  # ---------------------------------------------------------------
+  publish:
+    needs: [version, build-windows, build-android]
+    # `always()` is required here: a job's own `if:` is otherwise implicitly
+    # ANDed with `success()` over everything in `needs`, so with a plain
+    # `startsWith(...)` condition a single failed platform (e.g. Android's
+    # keystore secret going stale) would skip this job entirely and silently
+    # withhold the platform that *did* build. `always()` removes that implicit
+    # gate so the explicit success check below is the only one that applies -
+    # publish proceeds as long as at least one platform succeeded, and ships
+    # only that platform's assets (see the two download steps below).
+    if: always() && startsWith(github.ref, 'refs/tags/v') && (needs.build-windows.result == 'success' || needs.build-android.result == 'success')
+    runs-on: ubuntu-latest
+
+    steps:
+      # Each download is conditional on its own build having actually
+      # produced something. Steps don't inherit the job's needs-success
+      # gating the way jobs inherit it from their own needs (a step's
+      # implicit success() only looks at earlier steps in this same job,
+      # not at needs.*), so without this explicit check a missing platform
+      # would fail this download outright instead of just being absent.
+      - name: Download the Windows artifact
+        if: needs.build-windows.result == 'success'
+        uses: actions/download-artifact@v3
+        with:
+          name: MultiAI-windows-${{ needs.version.outputs.version }}
+          path: Releases
+
+      - name: Download the Android artifact
+        if: needs.build-android.result == 'success'
+        uses: actions/download-artifact@v3
+        with:
+          name: MultiAI-android-${{ needs.version.outputs.version }}
+          path: Releases
+
+      # Non-fatal - just makes a partial release loudly obvious in the run's
+      # summary instead of something a reviewer only notices later, looking
+      # at which files landed on the draft.
+      - name: Warn about a missing platform
+        if: needs.build-windows.result != 'success' || needs.build-android.result != 'success'
+        shell: bash
+        run: |
+          if [ "${{ needs.build-windows.result }}" != "success" ]; then
+            echo "::warning::build-windows did not succeed (${{ needs.build-windows.result }}) - this release will ship without Windows assets."
+          fi
+          if [ "${{ needs.build-android.result }}" != "success" ]; then
+            echo "::warning::build-android did not succeed (${{ needs.build-android.result }}) - this release will ship without the Android APK."
+          fi
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          # The whole folder: releases.win.json is the feed installed Windows
+          # apps read, the .nupkg files are what they download, and the APK is
+          # the Android download. An installer on its own would leave every
+          # existing Windows install unable to see the release at all.
+          # Gitea's own GITHUB_TOKEN can't touch github.com, so the release
+          # still goes to GitHub (where installed apps read the update feed)
+          # using a PAT secret.
+          token: ${{ secrets.GH_RELEASE_TOKEN }}
+          repository: CAJ654/MULTI-AI
+          tag_name: ${{ github.ref_name }}
+          files: Releases/*
+          # Stays a draft until reviewed - and that review is now also the
+          # update gate. Installed Windows apps read the feed from
+          # /releases/latest/download/, which GitHub resolves to the latest
+          # *published* release, so a draft is invisible to them. Publishing is
+          # what ships the update. Do not auto-publish to work around this.
+          draft: true
+          generate_release_notes: true
+          body: |
+            ## Windows
+
+            New here? Download **MultiAI-win-Setup.exe** below and run it. The
+            other Windows files are for the in-app updater.
+
+            **Already running Multi-AI on Windows?** Do nothing. The app checks
+            for updates on launch, downloads this version in the background,
+            and shows a **Relaunch to Update** button when it is ready. The
+            download is a small patch, not the whole app.
+
+            Windows SmartScreen will warn that the publisher is unknown — the
+            installer is unsigned. Choose *More info* → *Run anyway*.
+
+            **First launch downloads about 2.5 GB** of AI runtime (PyTorch and
+            friends). That happens once, and updates do not repeat it. You can
+            skip it and still use the on-device models, which need no backend.
+
+            **An NVIDIA GPU is recommended.** The server-backed models are
+            4-bit quantized for consumer VRAM; the app rates each model against
+            your hardware and tells you before you download one.
+
+            ## Android
+
+            Download **MultiAI-\<version\>-android.apk** below. This is a
+            direct install, not the Play Store, so Android will warn about
+            installing from an unknown source the first time — allow it for
+            whichever app you downloaded with (browser, Files app, etc.).
+
+            The Android build is on-device only: every model runs locally via
+            llama.cpp, nothing talks to a server, and there's no separate
+            backend download. There is also no in-app auto-updater on Android
+            — for a new version, download the new APK and install it over the
+            old one (your chat history and downloaded models are unaffected).
